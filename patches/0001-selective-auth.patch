@@ -1,0 +1,272 @@
+diff --git a/crates/horizon-client/src/game/dedicated.rs b/crates/horizon-client/src/game/dedicated.rs
+index eee12fe3..93c6a6f5 100644
+--- a/crates/horizon-client/src/game/dedicated.rs
++++ b/crates/horizon-client/src/game/dedicated.rs
+@@ -501,9 +501,10 @@ impl Game<'_> {
+             ),
+         );
+         let port = port.unwrap_or(props.server_port as u16);
+-        // MinecraftServer.initializeKeyPair (only online mode uses it).
++        // MinecraftServer.initializeKeyPair (online mode uses it, and so
++        // does selective auth, which verifies direct connections).
+         log("INFO", "Generating keypair");
+-        let online = if props.online_mode {
++        let online = if props.online_mode || props.auth_selective {
+             let key = horizon_protocol::rsa::RsaPrivateKey::generate(1024)
+                 .map_err(|e| format!("Failed to generate key pair: {e}"))?;
+             Some(Arc::new(OnlineMode {
+@@ -540,6 +541,18 @@ impl Game<'_> {
+                 "To change this, set \"online-mode\" to \"true\" in the server.properties file.",
+             );
+         }
++        if props.auth_selective {
++            log(
++                "INFO",
++                "Selective authentication is on: direct connections are verified with the session service; Floodgate (Bedrock) connections are exempt, and identities stay offline.",
++            );
++            if !props.auth_enforce {
++                log(
++                    "WARN",
++                    "auth-enforce is false: sessions that fail verification are logged and admitted anyway.",
++                );
++            }
++        }
+         let mut lists = Lists::load();
+         lists.use_whitelist = props.white_list;
+         lists.enforce_whitelist = props.enforce_whitelist;
+@@ -603,6 +616,8 @@ impl Game<'_> {
+             })),
+             gate: Some(gate),
+             online,
++            auth_selective: props.auth_selective,
++            auth_enforce: props.auth_enforce,
+             log: Some(NetLog {
+                 write: Arc::new(log_from),
+                 lang: Arc::new(horizon_client::net::load_language(&self.options.resources)),
+diff --git a/crates/horizon-client/src/lan/conn.rs b/crates/horizon-client/src/lan/conn.rs
+index fb91f300..9b094776 100644
+--- a/crates/horizon-client/src/lan/conn.rs
++++ b/crates/horizon-client/src/lan/conn.rs
+@@ -494,7 +494,7 @@ fn serve_connection(
+                 );
+                 return Ok(());
+             }
+-            serve_login(c, address, &shared)
++            serve_login(c, address, &shared, is_floodgate(&intention.host))
+         }
+         other => Err(format!("unknown intent {other}")),
+     }
+@@ -573,10 +573,24 @@ fn lost(shared: &Shared, user: &str, text: &str) {
+ /// UNIQUE_THREAD_ID: the User Authenticator threads are numbered from 1.
+ static AUTHENTICATORS: AtomicU32 = AtomicU32::new(0);
+ 
++/// How an authentication attempt ended, for the login that ran it.
++enum AuthOutcome {
++    /// The session service confirmed the session: the verified profile.
++    Verified((u128, Vec<login::Property>)),
++    /// The session could not be verified, but nothing was sent to the
++    /// client and the caller admits the player anyway (auth-enforce=false).
++    /// The connection is already encrypted at this point.
++    Unverified,
++    /// Verification failed and the client was disconnected: the text of
++    /// the refusal, for the "lost connection" line that follows.
++    Refused(String),
++}
++
+ /// ServerLoginPacketListenerImpl.handleKey and the User Authenticator
+ /// thread: check the client's answer to the encryption request, encrypt the
+ /// connection, and ask the session service whether the player joined with
+-/// this server's hash. The profile, or the text of the refusal.
++/// this server's hash. With admit_unverified, a session the service rejects
++/// or cannot check is logged and reported as Unverified instead of refused.
+ fn authenticate(
+     c: &mut Connection,
+     shared: &Shared,
+@@ -584,7 +598,8 @@ fn authenticate(
+     name: &str,
+     address: std::net::SocketAddr,
+     user: &str,
+-) -> Result<Result<(u128, Vec<login::Property>), String>, String> {
++    admit_unverified: bool,
++) -> Result<AuthOutcome, String> {
+     let e = |e: horizon_protocol::Error| e.to_string();
+     let mut challenge = [0u8; 4];
+     horizon_protocol::crypto::random_bytes(&mut challenge).map_err(e)?;
+@@ -632,9 +647,16 @@ fn authenticate(
+                 "INFO",
+                 &format!("UUID of player {name} is {}", uuid_string(profile.uuid)),
+             );
+-            Ok(Ok((profile.uuid, profile.properties)))
++            Ok(AuthOutcome::Verified((profile.uuid, profile.properties)))
+         }
+         Ok(None) => {
++            if admit_unverified {
++                log(
++                    "WARN",
++                    &format!("Username '{name}' tried to join with an invalid session (admitted anyway: auth-enforce is false)"),
++                );
++                return Ok(AuthOutcome::Unverified);
++            }
+             let text = refuse(
+                 c,
+                 shared,
+@@ -646,9 +668,16 @@ fn authenticate(
+                 "ERROR",
+                 &format!("Username '{name}' tried to join with an invalid session"),
+             );
+-            Ok(Err(text))
++            Ok(AuthOutcome::Refused(text))
+         }
+         Err(_) => {
++            if admit_unverified {
++                log(
++                    "WARN",
++                    "Couldn't verify username because servers are unavailable (admitted anyway: auth-enforce is false)",
++                );
++                return Ok(AuthOutcome::Unverified);
++            }
+             let text = refuse(
+                 c,
+                 shared,
+@@ -660,15 +689,23 @@ fn authenticate(
+                 "ERROR",
+                 "Couldn't verify username because servers are unavailable",
+             );
+-            Ok(Err(text))
++            Ok(AuthOutcome::Refused(text))
+         }
+     }
+ }
+ 
++/// Floodgate (Geyser's Bedrock authentication) appends its data to the
++/// handshake host string after a NUL separator. A direct client never
++/// sends one, so a NUL marks a Bedrock connection proxied by Geyser.
++fn is_floodgate(host: &str) -> bool {
++    host.contains('\0')
++}
++
+ fn serve_login(
+     mut c: Connection,
+     address: std::net::SocketAddr,
+     shared: &Arc<Shared>,
++    floodgate: bool,
+ ) -> Result<(), String> {
+     let e = |e: horizon_protocol::Error| e.to_string();
+     let (id, payload) = c.recv().map_err(e)?;
+@@ -690,20 +727,44 @@ fn serve_login(
+         .map(|log| user_name(&hello.name, address, log))
+         .unwrap_or_default();
+     // handleHello: online mode authenticates first; offline mode derives the
+-    // profile from the name.
+-    let (uuid, properties) = match &shared.config.online {
+-        Some(online) => match authenticate(&mut c, shared, online, &hello.name, address, &user) {
+-            Ok(Ok(profile)) => profile,
+-            Ok(Err(refused)) => {
+-                lost(shared, &user, &refused);
+-                return Ok(());
+-            }
+-            Err(err) => {
+-                lost(shared, &user, "Disconnected");
+-                return Err(err);
+-            }
+-        },
+-        None => (offline_uuid(&hello.name), Vec::new()),
++    // profile from the name. Selective auth (auth-selective=true) runs the
++    // same authentication for direct connections, but a Floodgate-proxied
++    // (Bedrock) connection stays on the offline path — it was already
++    // authenticated on the Xbox side — and a verified direct connection
++    // keeps its offline identity, so player data does not move.
++    let selective = shared.config.auth_selective;
++    let (uuid, properties) = if selective && floodgate {
++        (offline_uuid(&hello.name), Vec::new())
++    } else {
++        match &shared.config.online {
++            Some(online) => match authenticate(
++                &mut c,
++                shared,
++                online,
++                &hello.name,
++                address,
++                &user,
++                selective && !shared.config.auth_enforce,
++            ) {
++                Ok(AuthOutcome::Verified(profile)) => {
++                    if selective {
++                        (offline_uuid(&hello.name), Vec::new())
++                    } else {
++                        profile
++                    }
++                }
++                Ok(AuthOutcome::Unverified) => (offline_uuid(&hello.name), Vec::new()),
++                Ok(AuthOutcome::Refused(refused)) => {
++                    lost(shared, &user, &refused);
++                    return Ok(());
++                }
++                Err(err) => {
++                    lost(shared, &user, "Disconnected");
++                    return Err(err);
++                }
++            },
++            None => (offline_uuid(&hello.name), Vec::new()),
++        }
+     };
+     // verifyLoginAndFinishConnectionSetup: PlayerList.canPlayerLogin, then
+     // duplicates and a full server.
+diff --git a/crates/horizon-client/src/lan/mod.rs b/crates/horizon-client/src/lan/mod.rs
+index 3e9b93ca..a6ac4bd2 100644
+--- a/crates/horizon-client/src/lan/mod.rs
++++ b/crates/horizon-client/src/lan/mod.rs
+@@ -138,6 +138,13 @@ pub struct NetConfig {
+     pub gate: Option<LoginGate>,
+     /// Online mode: players are authenticated (none on a LAN world).
+     pub online: Option<Arc<OnlineMode>>,
++    /// auth-selective: direct connections are authenticated like online
++    /// mode, but Floodgate-proxied (Bedrock) connections stay offline and
++    /// every identity stays the offline one (see lan::conn::serve_login).
++    pub auth_selective: bool,
++    /// auth-enforce: refuse sessions the session service cannot verify.
++    /// When false, an unverified session is logged and admitted anyway.
++    pub auth_enforce: bool,
+     pub log: Option<NetLog>,
+     /// server.properties `resource-pack`: offered to every player during
+     /// configuration (a dedicated server's; MinecraftServer.getServerResourcePack).
+@@ -166,6 +173,8 @@ impl NetConfig {
+             bypasses_limit: None,
+             gate: None,
+             online: None,
++            auth_selective: false,
++            auth_enforce: true,
+             log: None,
+             resource_pack: None,
+         }
+diff --git a/crates/horizon-server-files/src/properties.rs b/crates/horizon-server-files/src/properties.rs
+index f2cf6ecd..72090a35 100644
+--- a/crates/horizon-server-files/src/properties.rs
++++ b/crates/horizon-server-files/src/properties.rs
+@@ -25,6 +25,8 @@ pub struct ResourcePackInfo {
+ pub struct ServerProperties {
+     pub online_mode: bool,
+     pub prevent_proxy_connections: bool,
++    pub auth_selective: bool,
++    pub auth_enforce: bool,
+     pub server_ip: String,
+     pub allow_flight: bool,
+     pub motd: String,
+@@ -248,6 +250,8 @@ impl ServerProperties {
+         let mut warnings = Vec::new();
+         let online_mode = r.boolean("online-mode", true);
+         let prevent_proxy_connections = r.boolean("prevent-proxy-connections", false);
++        let auth_selective = r.boolean("auth-selective", false);
++        let auth_enforce = r.boolean("auth-enforce", true);
+         let server_ip = r.string("server-ip", "");
+         let allow_flight = r.boolean("allow-flight", false);
+         let motd = r.string("motd", "A Minecraft Server");
+@@ -390,6 +394,8 @@ impl ServerProperties {
+         Ok(Self {
+             online_mode,
+             prevent_proxy_connections,
++            auth_selective,
++            auth_enforce,
+             server_ip,
+             allow_flight,
+             motd,
