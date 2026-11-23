@@ -79,6 +79,13 @@ branch and the authentication outcome), `crates/horizon-client/src/lan/mod.rs`
 (keypair generation and startup logging), and
 `crates/horizon-server-files/src/properties.rs` (the two new keys).
 
+## Status
+
+Verified to type-check against the base commit with
+`cargo check -p horizon-client` and `cargo check -p horizon-server-files`.
+Not yet run-tested against a live server; the `auth-enforce=false` rollout
+above is there so the first live test cannot lock anyone out.
+
 ## License
 
 MIT, the same license as Horizon itself. This patch is a derivative work
